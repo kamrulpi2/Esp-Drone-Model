@@ -1,0 +1,621 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include "esp_wifi.h"
+
+// ─── WiFi ─────────────────────────────
+const char* WIFI_SSID     = "AI";
+const char* WIFI_PASSWORD = "12345678";
+
+// ─── MOTOR PINS ───────────────────────
+#define MOTOR_FL_PIN 4
+#define MOTOR_FR_PIN 33
+#define MOTOR_BL_PIN 32
+#define MOTOR_BR_PIN 25
+
+// ─── IMU ──────────────────────────────
+#define SDA_PIN 22
+#define SCL_PIN 21
+#define INT_PIN 14
+
+// ─── PWM DEFAULTS ─────────────────────
+#define PWM_RES       10
+#define PWM_MAX       1023
+#define MOTOR_MIN_DUTY 150
+
+// ─── Objects ──────────────────────────
+MPU6050 mpu;
+WebServer server(80);
+
+// ─── Per-motor PWM frequency & channels ──
+uint32_t motorFreq[4] = {20000, 20000, 20000, 20000};
+const int motorChannels[4] = {0, 1, 2, 3};
+
+// ─── Flight Command ───────────────────
+struct FlightCmd {
+  float throttle = 0, roll = 0, pitch = 0, yaw = 0;
+  bool armed = false;
+} cmd;
+
+// ─── Manual motor override ────────────
+bool manualMode = false;
+int manualDuty[4] = {0, 0, 0, 0};
+
+// ─── IMU Data ─────────────────────────
+float angleRoll = 0, anglePitch = 0, angleYaw = 0;
+float gyrZ = 0;
+float gyroX_offset = 0, gyroY_offset = 0, gyroZ_offset = 0;
+bool imuOk = false;
+
+// ─── PID ──────────────────────────────
+float Kp = 0.8f, Ki = 0.0f, Kd = 0.2f;
+float prevErrRoll = 0, prevErrPitch = 0;
+float integRoll   = 0, integPitch  = 0;
+
+// ─── Motor state ──────────────────────
+int motorDuty[4];
+
+// ─── Timing ───────────────────────────
+unsigned long lastLoopUs = 0;
+unsigned long lastCmdMs  = 0;
+bool calibrating = false;
+
+// ─────────────────────────────────────
+void motorInit() {
+  int pins[4] = {MOTOR_FL_PIN, MOTOR_FR_PIN, MOTOR_BL_PIN, MOTOR_BR_PIN};
+  for (int i = 0; i < 4; i++) {
+    pinMode(pins[i], OUTPUT);
+    digitalWrite(pins[i], LOW);
+
+    ledcSetup(motorChannels[i], motorFreq[i], PWM_RES);
+    ledcAttachPin(pins[i], motorChannels[i]);
+    ledcWrite(motorChannels[i], 0);
+  }
+}
+
+void motorsOff() {
+  for (int i = 0; i < 4; i++) motorDuty[i] = 0;
+  ledcWrite(motorChannels[0], 0);
+  ledcWrite(motorChannels[1], 0);
+  ledcWrite(motorChannels[2], 0);
+  ledcWrite(motorChannels[3], 0);
+}
+
+void setMotorFreq(int idx, uint32_t freq) {
+  int pins[4] = {MOTOR_FL_PIN, MOTOR_FR_PIN, MOTOR_BL_PIN, MOTOR_BR_PIN};
+  motorFreq[idx] = freq;
+
+  ledcDetachPin(pins[idx]);
+  ledcSetup(motorChannels[idx], freq, PWM_RES);
+  ledcAttachPin(pins[idx], motorChannels[idx]);
+  ledcWrite(motorChannels[idx], 0);
+}
+
+void setMotors(int fl, int fr, int bl, int br) {
+  fl = constrain(fl, 0, PWM_MAX);
+  fr = constrain(fr, 0, PWM_MAX);
+  bl = constrain(bl, 0, PWM_MAX);
+  br = constrain(br, 0, PWM_MAX);
+
+  ledcWrite(motorChannels[0], fl);
+  ledcWrite(motorChannels[1], fr);
+  ledcWrite(motorChannels[2], bl);
+  ledcWrite(motorChannels[3], br);
+
+  motorDuty[0] = fl; motorDuty[1] = fr;
+  motorDuty[2] = bl; motorDuty[3] = br;
+}
+
+// ─────────────────────────────────────
+void readIMU(float dt) {
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  float accX = ax / 16384.0f;
+  float accY = ay / 16384.0f;
+  float accZ = az / 16384.0f;
+  float gyrX = (gx / 131.0f) - gyroX_offset;
+  float gyrY = (gy / 131.0f) - gyroY_offset;
+  gyrZ       = (gz / 131.0f) - gyroZ_offset;
+  float rollAcc  = atan2f(accY, accZ) * 57.3f;
+  float pitchAcc = atan2f(-accX, sqrtf(accY*accY + accZ*accZ)) * 57.3f;
+  angleRoll  = 0.96f * (angleRoll  + gyrX * dt) + 0.04f * rollAcc;
+  anglePitch = 0.96f * (anglePitch + gyrY * dt) + 0.04f * pitchAcc;
+  angleYaw  += gyrZ * dt;
+}
+
+// ─────────────────────────────────────
+void calibrateGyro() {
+  calibrating = true;
+  motorsOff();
+  Serial.println("Calibrating — keep drone STILL...");
+  long sx = 0, sy = 0, sz = 0;
+  for (int i = 0; i < 1000; i++) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    sx += gx; sy += gy; sz += gz;
+    delay(2);
+  }
+  gyroX_offset = (sx / 1000.0f) / 131.0f;
+  gyroY_offset = (sy / 1000.0f) / 131.0f;
+  gyroZ_offset = (sz / 1000.0f) / 131.0f;
+  integRoll = integPitch = 0;
+  prevErrRoll = prevErrPitch = 0;
+  angleRoll = anglePitch = angleYaw = 0;
+  calibrating = false;
+  Serial.println("Calibration done.");
+}
+
+// ─────────────────────────────────────
+// WEB UI
+// ─────────────────────────────────────
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drone Tuning</title>
+<style>
+  :root {
+    --bg: #0d0f12;
+    --panel: #161a1f;
+    --border: #2a2f38;
+    --accent: #00c8a0;
+    --accent2: #f5a623;
+    --danger: #e94f4f;
+    --text: #e2e8f0;
+    --muted: #6b7b8d;
+    --font: 'Courier New', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 13px; min-height: 100vh; padding-bottom: 120px; }
+  h3 { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  .topbar { display: flex; align-items: center; justify-content: space-between; padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  .topbar .logo { font-size: 15px; font-weight: bold; letter-spacing: 0.1em; color: var(--accent); }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 6px; }
+  .status-dot.armed { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+  .status-dot.connected { background: var(--accent); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 16px 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  label { display: block; color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+  input[type=number], input[type=text] {
+    width: 100%; background: #0d0f12; border: 1px solid var(--border); color: var(--text);
+    font-family: var(--font); font-size: 13px; padding: 5px 8px; border-radius: 3px; outline: none;
+  }
+  input[type=number]:focus { border-color: var(--accent); }
+  input[type=range] { width: 100%; accent-color: var(--accent); margin: 6px 0; }
+  .val { color: var(--accent); font-size: 11px; text-align: right; margin-top: 2px; }
+  button { font-family: var(--font); font-size: 12px; padding: 7px 14px; border-radius: 3px; cursor: pointer; border: 1px solid var(--border); }
+  .btn-primary { background: var(--accent); color: #0d0f12; border-color: var(--accent); font-weight: bold; }
+  .btn-arm { background: transparent; color: var(--danger); border-color: var(--danger); font-weight: bold; letter-spacing: 0.08em; padding: 8px 20px; }
+  .btn-arm.armed { background: var(--danger); color: white; }
+  .btn-cal { background: transparent; color: var(--accent2); border-color: var(--accent2); }
+  .btn-cal:disabled { opacity: 0.4; cursor: default; }
+  .motor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .motor-box { background: #0d0f12; border: 1px solid var(--border); border-radius: 4px; padding: 10px; }
+  .motor-label { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+  .motor-val { font-size: 20px; font-weight: bold; color: var(--accent); letter-spacing: 0.05em; }
+  .imu-row { display: flex; justify-content: space-between; margin-bottom: 6px; }
+  .imu-key { color: var(--muted); }
+  .imu-val { color: var(--accent2); font-weight: bold; }
+  .throttle-bar-wrap {
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 100;
+    background: var(--panel); border-top: 2px solid var(--accent);
+    padding: 12px 20px 16px;
+  }
+  .throttle-bar-wrap label { color: var(--accent); font-size: 11px; letter-spacing: 0.1em; margin-bottom: 6px; }
+  #throttle { width: 100%; height: 18px; accent-color: var(--danger); }
+  .tval { color: var(--danger); font-size: 16px; font-weight: bold; text-align: center; margin-top: 4px; }
+  .tag { display: inline-block; font-size: 10px; padding: 2px 6px; border-radius: 2px; }
+  .tag.green { background: #0f3d2e; color: var(--accent); }
+  .tag.red { background: #3d0f0f; color: var(--danger); }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="logo">▲ DRONE TUNING</span>
+  <span><span class="status-dot connected" id="connDot"></span><span id="connLabel">CONNECTED</span></span>
+  <span><span class="status-dot" id="armDot"></span><span id="armLabel">DISARMED</span></span>
+</div>
+
+<div class="grid" style="margin-top:4px">
+
+  <div class="panel" style="grid-column:1/-1;display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <button class="btn-arm" id="armBtn" onclick="toggleArm()">ARM</button>
+    <button class="btn-cal" id="calBtn" onclick="doCalibrate()">AUTO CALIBRATE</button>
+    <span id="calStatus" style="color:var(--muted);font-size:11px"></span>
+    <span id="imuTag" class="tag green" style="margin-left:auto">IMU OK</span>
+  </div>
+
+  <div class="panel">
+    <h3>Motor PWM Frequency (Hz)</h3>
+    <div class="motor-grid">
+      <div><label>FL (M1)</label><input type="number" id="fFL" value="20000" min="1000" max="40000"></div>
+      <div><label>FR (M2)</label><input type="number" id="fFR" value="20000" min="1000" max="40000"></div>
+      <div><label>BL (M3)</label><input type="number" id="fBL" value="20000" min="1000" max="40000"></div>
+      <div><label>BR (M4)</label><input type="number" id="fBR" value="20000" min="1000" max="40000"></div>
+    </div>
+    <button class="btn-primary" style="margin-top:10px;width:100%" onclick="applyFreqs()">APPLY FREQUENCIES</button>
+  </div>
+
+  <div class="panel">
+    <h3>PID Tuning</h3>
+    <div>
+      <label>Kp (Proportional)</label>
+      <input type="range" id="kp" min="0" max="5" step="0.05" value="0.8" oninput="document.getElementById('kpV').textContent=parseFloat(this.value).toFixed(2)">
+      <div class="val" id="kpV">0.80</div>
+    </div>
+    <div style="margin-top:8px">
+      <label>Ki (Integral)</label>
+      <input type="range" id="ki" min="0" max="2" step="0.01" value="0" oninput="document.getElementById('kiV').textContent=parseFloat(this.value).toFixed(2)">
+      <div class="val" id="kiV">0.00</div>
+    </div>
+    <div style="margin-top:8px">
+      <label>Kd (Derivative)</label>
+      <input type="range" id="kd" min="0" max="2" step="0.01" value="0.2" oninput="document.getElementById('kdV').textContent=parseFloat(this.value).toFixed(2)">
+      <div class="val" id="kdV">0.20</div>
+    </div>
+    <button class="btn-primary" style="margin-top:10px;width:100%" onclick="applyPID()">APPLY PID</button>
+  </div>
+
+  <div class="panel" style="grid-column:1/-1">
+    <h3>Individual Motor Override</h3>
+    <p style="color:var(--muted);font-size:11px;margin-bottom:10px">When enabled, bypasses PID and sets each motor directly. DISARM first to activate safely.</p>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+        <input type="checkbox" id="manualToggle" onchange="toggleManual()" style="accent-color:var(--accent2)">
+        <span>Manual override mode</span>
+      </label>
+    </div>
+    <div class="motor-grid">
+      <div>
+        <label>FL M1 duty</label>
+        <input type="range" id="m1" min="0" max="1023" step="1" value="0" oninput="document.getElementById('m1V').textContent=this.value" disabled>
+        <div class="val" id="m1V">0</div>
+      </div>
+      <div>
+        <label>FR M2 duty</label>
+        <input type="range" id="m2" min="0" max="1023" step="1" value="0" oninput="document.getElementById('m2V').textContent=this.value" disabled>
+        <div class="val" id="m2V">0</div>
+      </div>
+      <div>
+        <label>BL M3 duty</label>
+        <input type="range" id="m3" min="0" max="1023" step="1" value="0" oninput="document.getElementById('m3V').textContent=this.value" disabled>
+        <div class="val" id="m3V">0</div>
+      </div>
+      <div>
+        <label>BR M4 duty</label>
+        <input type="range" id="m4" min="0" max="1023" step="1" value="0" oninput="document.getElementById('m4V').textContent=this.value" disabled>
+        <div class="val" id="m4V">0</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Control Setpoints</h3>
+    <label>Roll setpoint (deg)</label>
+    <input type="range" id="roll" min="-30" max="30" step="1" value="0" oninput="document.getElementById('rollV').textContent=this.value+'°'">
+    <div class="val" id="rollV">0°</div>
+    <label style="margin-top:10px">Pitch setpoint (deg)</label>
+    <input type="range" id="pitch" min="-30" max="30" step="1" value="0" oninput="document.getElementById('pitchV').textContent=this.value+'°'">
+    <div class="val" id="pitchV">0°</div>
+  </div>
+
+  <div class="panel">
+    <h3>Live Telemetry</h3>
+    <div class="imu-row"><span class="imu-key">Roll</span><span class="imu-val" id="lRoll">—</span></div>
+    <div class="imu-row"><span class="imu-key">Pitch</span><span class="imu-val" id="lPitch">—</span></div>
+    <div class="imu-row"><span class="imu-key">Yaw</span><span class="imu-val" id="lYaw">—</span></div>
+    <div style="border-top:1px solid var(--border);margin:10px 0 8px"></div>
+    <div class="motor-grid">
+      <div class="motor-box"><div class="motor-label">FL M1</div><div class="motor-val" id="tFL">0</div></div>
+      <div class="motor-box"><div class="motor-label">FR M2</div><div class="motor-val" id="tFR">0</div></div>
+      <div class="motor-box"><div class="motor-label">BL M3</div><div class="motor-val" id="tBL">0</div></div>
+      <div class="motor-box"><div class="motor-label">BR M4</div><div class="motor-val" id="tBR">0</div></div>
+    </div>
+  </div>
+
+</div>
+
+<div class="throttle-bar-wrap">
+  <label>THROTTLE — ARM drone first, then increase</label>
+  <input type="range" id="throttle" min="0" max="100" step="1" value="0" oninput="document.getElementById('thrVal').textContent=this.value+'%'">
+  <div class="tval" id="thrVal">0%</div>
+</div>
+
+<script>
+let armed = false;
+let manualActive = false;
+
+function toggleArm() {
+  armed = !armed;
+  document.getElementById('armBtn').textContent = armed ? 'DISARM' : 'ARM';
+  document.getElementById('armBtn').classList.toggle('armed', armed);
+  document.getElementById('armDot').classList.toggle('armed', armed);
+  document.getElementById('armLabel').textContent = armed ? 'ARMED' : 'DISARMED';
+  if (!armed) document.getElementById('throttle').value = 0;
+}
+
+function toggleManual() {
+  manualActive = document.getElementById('manualToggle').checked;
+  ['m1','m2','m3','m4'].forEach(id => document.getElementById(id).disabled = !manualActive);
+}
+
+function applyFreqs() {
+  fetch('/freqs', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      fl: parseInt(document.getElementById('fFL').value),
+      fr: parseInt(document.getElementById('fFR').value),
+      bl: parseInt(document.getElementById('fBL').value),
+      br: parseInt(document.getElementById('fBR').value)
+    })
+  });
+}
+
+function applyPID() {
+  fetch('/pid', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      kp: parseFloat(document.getElementById('kp').value),
+      ki: parseFloat(document.getElementById('ki').value),
+      kd: parseFloat(document.getElementById('kd').value)
+    })
+  });
+}
+
+function doCalibrate() {
+  const btn = document.getElementById('calBtn');
+  btn.disabled = true;
+  document.getElementById('calStatus').textContent = 'Calibrating — keep drone still...';
+  fetch('/calibrate', {method:'POST'}).then(()=>{
+    document.getElementById('calStatus').textContent = 'Done!';
+    btn.disabled = false;
+    setTimeout(()=>document.getElementById('calStatus').textContent='', 3000);
+  }).catch(()=>{ btn.disabled=false; });
+}
+
+setInterval(() => {
+  const throttle = parseInt(document.getElementById('throttle').value) / 100;
+  const roll     = parseInt(document.getElementById('roll').value) / 30;
+  const pitch    = parseInt(document.getElementById('pitch').value) / 30;
+
+  const body = {
+    armed,
+    throttle,
+    roll,
+    pitch,
+    yaw: 0,
+    manual: manualActive,
+    m1: parseInt(document.getElementById('m1').value),
+    m2: parseInt(document.getElementById('m2').value),
+    m3: parseInt(document.getElementById('m3').value),
+    m4: parseInt(document.getElementById('m4').value)
+  };
+
+  fetch('/cmd', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+}, 80);
+
+setInterval(() => {
+  fetch('/telemetry').then(r=>r.json()).then(d=>{
+    document.getElementById('lRoll').textContent  = d.roll.toFixed(1)+'°';
+    document.getElementById('lPitch').textContent = d.pitch.toFixed(1)+'°';
+    document.getElementById('lYaw').textContent   = d.yaw.toFixed(1)+'°';
+    document.getElementById('tFL').textContent = d.m[0];
+    document.getElementById('tFR').textContent = d.m[1];
+    document.getElementById('tBL').textContent = d.m[2];
+    document.getElementById('tBR').textContent = d.m[3];
+    document.getElementById('imuTag').textContent = d.imu ? 'IMU OK' : 'IMU FAIL';
+    document.getElementById('imuTag').className = 'tag ' + (d.imu ? 'green' : 'red');
+  }).catch(()=>{});
+}, 200);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ─── HTTP Handlers ────────────────────
+
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleCmd() {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    server.send(400, "text/plain", "bad json"); return;
+  }
+  cmd.armed    = doc["armed"]    | false;
+  cmd.throttle = doc["throttle"] | 0.0f;
+  cmd.roll     = doc["roll"]     | 0.0f;
+  cmd.pitch    = doc["pitch"]    | 0.0f;
+  cmd.yaw      = doc["yaw"]      | 0.0f;
+
+  bool manual  = doc["manual"]   | false;
+  manualMode   = manual;
+  if (manual) {
+    manualDuty[0] = doc["m1"] | 0;
+    manualDuty[1] = doc["m2"] | 0;
+    manualDuty[2] = doc["m3"] | 0;
+    manualDuty[3] = doc["m4"] | 0;
+  }
+  lastCmdMs = millis();
+  server.send(200, "text/plain", "ok");
+}
+
+void handlePID() {
+  StaticJsonDocument<128> doc;
+  deserializeJson(doc, server.arg("plain"));
+  Kp = doc["kp"] | Kp;
+  Ki = doc["ki"] | Ki;
+  Kd = doc["kd"] | Kd;
+  server.send(200, "text/plain", "ok");
+}
+
+void handleFreqs() {
+  StaticJsonDocument<128> doc;
+  deserializeJson(doc, server.arg("plain"));
+  if (doc.containsKey("fl")) setMotorFreq(0, (uint32_t)(doc["fl"] | 20000));
+  if (doc.containsKey("fr")) setMotorFreq(1, (uint32_t)(doc["fr"] | 20000));
+  if (doc.containsKey("bl")) setMotorFreq(2, (uint32_t)(doc["bl"] | 20000));
+  if (doc.containsKey("br")) setMotorFreq(3, (uint32_t)(doc["br"] | 20000));
+  server.send(200, "text/plain", "ok");
+}
+
+void handleCalibrate() {
+  calibrateGyro();
+  server.send(200, "text/plain", "ok");
+}
+
+void handleTelemetry() {
+  StaticJsonDocument<128> doc;
+  doc["roll"]  = angleRoll;
+  doc["pitch"] = anglePitch;
+  doc["yaw"]   = angleYaw;
+  doc["imu"]   = imuOk;
+  JsonArray m = doc.createNestedArray("m");
+  m.add(motorDuty[0]); m.add(motorDuty[1]);
+  m.add(motorDuty[2]); m.add(motorDuty[3]);
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out); 
+}
+
+// ─────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Safe motor init
+  for (int p : {MOTOR_FL_PIN, MOTOR_FR_PIN, MOTOR_BL_PIN, MOTOR_BR_PIN}) {
+    pinMode(p, OUTPUT);
+    digitalWrite(p, LOW);
+  }
+  motorInit();
+
+  pinMode(INT_PIN, INPUT);
+
+  // ─── IMU Init (MPU6500 compatible) ───
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  delay(100);
+
+  mpu.initialize();
+  delay(50);
+
+  mpu.setSleepEnabled(false);
+  mpu.setClockSource(MPU6050_CLOCK_PLL_XGYRO);
+  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+  delay(50);
+
+  uint8_t who = mpu.getDeviceID();
+  Serial.print("WHO_AM_I: 0x");
+  Serial.println(who, HEX);
+
+  if (who == 0x68 || who == 0x70 || who == 0x71 || who == 0x38 ) {
+    imuOk = true;
+    Serial.println("IMU OK (MPU6050/6500 detected)");
+    calibrateGyro();
+  } else {
+    imuOk = false;
+    Serial.println("IMU FAIL - Unknown device");
+  }
+
+  // ─── WiFi AP ───
+  WiFi.mode(WIFI_AP);
+  delay(100);
+
+  bool apStarted = WiFi.softAP(WIFI_SSID, WIFI_PASSWORD, 1, 0, 4);  // channel 1
+
+  if (apStarted) {
+    Serial.println("SoftAP started successfully!");
+    Serial.print("SSID: ");
+    Serial.println(WIFI_SSID);
+    Serial.print("Password: ");
+    Serial.println(WIFI_PASSWORD);
+    Serial.print("IP Address: http://");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("SoftAP FAILED to start!");
+  }
+
+  server.on("/",          HTTP_GET,  handleRoot);
+  server.on("/cmd",       HTTP_POST, handleCmd);
+  server.on("/pid",       HTTP_POST, handlePID);
+  server.on("/freqs",     HTTP_POST, handleFreqs);
+  server.on("/calibrate", HTTP_POST, handleCalibrate);
+  server.on("/telemetry", HTTP_GET,  handleTelemetry);
+  server.begin();
+
+  lastLoopUs = micros();
+}
+
+// ─────────────────────────────────────
+void loop() {
+  server.handleClient();
+
+  if (calibrating) return;
+
+  float dt = (micros() - lastLoopUs) / 1e6f;
+  lastLoopUs = micros();
+  if (dt <= 0 || dt > 0.1f) dt = 0.01f;
+
+  if (imuOk) readIMU(dt);
+
+  // Watchdog: disarm if no command for 1.5 s
+  if (millis() - lastCmdMs > 1500 && lastCmdMs != 0) {
+    cmd.armed = false;
+  }
+
+  if (!cmd.armed || cmd.throttle < 0.05f) {
+    motorsOff();
+    return;
+  }
+
+  // Manual override mode
+  if (manualMode) {
+    setMotors(manualDuty[0], manualDuty[1], manualDuty[2], manualDuty[3]);
+    return;
+  }
+
+  // PID flight mode
+  int base = MOTOR_MIN_DUTY + (int)(cmd.throttle * (PWM_MAX - MOTOR_MIN_DUTY));
+
+  float setR = cmd.roll  * 30.0f;
+  float setP = cmd.pitch * 30.0f;
+
+  float errR = setR - angleRoll;
+  float errP = setP - anglePitch;
+
+  integRoll  += errR * dt;
+  integPitch += errP * dt;
+  integRoll  = constrain(integRoll,  -200.0f, 200.0f);
+  integPitch = constrain(integPitch, -200.0f, 200.0f);
+
+  float dR = (errR - prevErrRoll)  / dt;
+  float dP = (errP - prevErrPitch) / dt;
+
+  float pidR = Kp * errR + Ki * integRoll  + Kd * dR;
+  float pidP = Kp * errP + Ki * integPitch + Kd * dP;
+
+  prevErrRoll  = errR;
+  prevErrPitch = errP;
+
+  // Motor mixing (X-quad)
+  setMotors(
+    base - (int)pidR + (int)pidP,
+    base + (int)pidR + (int)pidP,
+    base - (int)pidR - (int)pidP,
+    base + (int)pidR - (int)pidP
+  );
+}
