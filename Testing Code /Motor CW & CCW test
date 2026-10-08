@@ -1,0 +1,79 @@
+/*
+ Simple Motor Test (ESP32 DevKit V1)
+ * Runs motor 1, 2, 3, 4 one by one, 3 seconds each.
+ * Serial Monitor: 115200 baud
+ *
+ * PROPS (top view, X frame):   FL(CW)  FR(CCW)
+ *                              RL(CCW) RR(CW)
+ *
+ * !!! REMOVE PROPELLERS BEFORE TESTING !!!
+ */
+
+#define PIN_FR 33
+#define PIN_FL 4
+#define PIN_RR 25
+#define PIN_RL 32
+
+#define PWM_FREQ   20000
+#define PWM_BITS   10
+#define TEST_POWER 25      // percent (0-100)
+#define RUN_MS     3000    // run time per motor
+#define PAUSE_MS   1000    // pause between motors
+
+struct Motor {
+  int pin;
+  const char *name;
+  const char *dir;
+};
+
+Motor motors[4] = {
+  {PIN_FR, "FR (front right)", "CCW"},   // motor 1
+  {PIN_FL, "FL (front left)",  "CW"},    // motor 2
+  {PIN_RR, "RR (rear right)",  "CW"},    // motor 3
+  {PIN_RL, "RL (rear left)",   "CCW"},   // motor 4
+};
+
+void pwmWrite(int pin, int duty) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(pin, duty);
+#else
+  for (int i = 0; i < 4; i++) if (motors[i].pin == pin) ledcWrite(i, duty);
+#endif
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  for (int i = 0; i < 4; i++) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcAttach(motors[i].pin, PWM_FREQ, PWM_BITS);
+#else
+    ledcSetup(i, PWM_FREQ, PWM_BITS);
+    ledcAttachPin(motors[i].pin, i);
+#endif
+    pwmWrite(motors[i].pin, 0);
+  }
+
+  Serial.println();
+  Serial.println("=== AerialX Motor Test ===");
+  Serial.println("REMOVE PROPS! Starting in 5 seconds...");
+  delay(5000);
+}
+
+void loop() {
+  int duty = ((1 << PWM_BITS) - 1) * TEST_POWER / 100;
+
+  for (int i = 0; i < 4; i++) {
+    Serial.printf("Motor %d  |  %s  |  pin %d  |  spin: %s  |  running %d s\n",
+                  i + 1, motors[i].name, motors[i].pin, motors[i].dir, RUN_MS / 1000);
+    pwmWrite(motors[i].pin, duty);
+    delay(RUN_MS);
+    pwmWrite(motors[i].pin, 0);
+    Serial.printf("Motor %d stopped\n", i + 1);
+    delay(PAUSE_MS);
+  }
+
+  Serial.println("--- test done, repeating in 5 seconds ---\n");
+  delay(5000);
+}
