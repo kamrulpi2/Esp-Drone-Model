@@ -1,0 +1,651 @@
+/*
+ * AerialX Flight Controller  -  ESP32 DevKit V1 + MPU6050
+ * --------------------------------------------------------
+ *  - Madgwick AHRS (fast start, then fine)           -> stable attitude
+ *  - Cascaded control: Angle P  ->  Rate PID (+ filtered D on measurement,
+ *    anti-windup, mixer desaturation)                -> "super PID"
+ *  - 6-position accel calibration (shell cmd: ca), same output as your app
+ *  - Calibration + PID + trim saved in flash (NVS), loaded on every boot
+ *  - Gyro auto-zero on every boot (removes temperature drift)
+ *  - MAVLink over UDP 14550 (WiFi AP "AerialX"), shell, attitude, heartbeat
+ *  - Failsafe: link lost, crash/tilt, IMU error -> motors off
+ *
+ * Board : "DOIT ESP32 DEVKIT V1"   (Arduino-ESP32 core 2.x or 3.x)
+ * No external libraries needed.
+ *
+ * WIRING
+ *   MPU6050  SDA->GPIO21  SCL->GPIO22  VCC->3V3  GND->GND
+ *   Motors (MOSFET gate / brushed driver):
+ *      FR=GPIO25  FL=GPIO26  RR=GPIO32  RL=GPIO33
+ *   Optional battery sense: divider -> GPIO35
+ *
+ * PROPS (top view, X frame):   FL(CW)  FR(CCW)
+ *                              RL(CCW) RR(CW)
+ * If yaw spins away, swap YAW_DIR to -1.  If a motor is wrong use 'mt'.
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Preferences.h>
+#include <stdarg.h>
+
+// ============================ CONFIG ==============================
+#define WIFI_SSID      "AerialX"
+#define WIFI_PASS      "12345678"      // min 8 chars
+#define UDP_PORT       14550
+
+#define PIN_FR 33
+#define PIN_FL 4
+#define PIN_RR 25
+#define PIN_RL 32
+
+#define PWM_FREQ 20000
+#define PWM_BITS 10
+#define MOTOR_IDLE 0.04f               // idle spin when armed (0..1)
+
+#define USE_VBAT   0                   // 1 = read battery on GPIO35
+#define PIN_VBAT   35
+#define VBAT_RATIO 2.0f                // (R1+R2)/R2 of your divider
+
+// Mount orientation: X = forward, Y = left, Z = up.  Flip signs if needed.
+#define AX_SIGN  1
+#define AY_SIGN  1
+#define AZ_SIGN  1
+#define GX_SIGN  1
+#define GY_SIGN  1
+#define GZ_SIGN  1
+#define YAW_DIR  1
+
+#define LOOP_HZ        500
+#define LINK_TIMEOUT   1000            // ms without MANUAL_CONTROL -> disarm
+#define CAL_WINDOW_MS  8000
+#define CAL_SAMPLE_MS  3000            // last 3 s of every window is averaged
+
+// ============================ SETTINGS ============================
+struct Cfg {
+  uint32_t magic;
+  float gb[3];            // gyro bias  (deg/s)
+  float ab[3];            // accel bias (g)
+  float as[3];            // accel scale
+  float rp, ri, rd;       // roll  rate PID
+  float pp, pi, pd;       // pitch rate PID
+  float yp, yi, yd;       // yaw   rate PID
+  float angP;             // angle loop P
+  float trimR, trimP;     // level trim (deg)
+  float maxAngle;         // deg
+  float maxYaw;           // deg/s
+};
+#define CFG_MAGIC 0xA3E41A07
+Cfg cfg;
+Preferences prefs;
+
+void cfgDefaults() {
+  cfg.magic = CFG_MAGIC;
+  for (int i = 0; i < 3; i++) { cfg.gb[i] = 0; cfg.ab[i] = 0; cfg.as[i] = 1; }
+  cfg.rp = 0.0015f; cfg.ri = 0.0030f; cfg.rd = 0.00004f;
+  cfg.pp = 0.0015f; cfg.pi = 0.0030f; cfg.pd = 0.00004f;
+  cfg.yp = 0.0030f; cfg.yi = 0.0030f; cfg.yd = 0.0f;
+  cfg.angP = 5.0f;
+  cfg.trimR = 0; cfg.trimP = 0;
+  cfg.maxAngle = 35; cfg.maxYaw = 150;
+}
+bool cfgSave() {
+  prefs.begin("aerialx", false);
+  size_t n = prefs.putBytes("cfg", &cfg, sizeof(cfg));
+  prefs.end();
+  return n == sizeof(cfg);
+}
+void cfgLoad() {
+  cfgDefaults();
+  prefs.begin("aerialx", true);
+  Cfg t;
+  if (prefs.getBytes("cfg", &t, sizeof(t)) == sizeof(t) && t.magic == CFG_MAGIC) cfg = t;
+  prefs.end();
+}
+
+// ============================ SHELL OUT ===========================
+struct Line { char s[90]; };
+QueueHandle_t shellQ;
+void shellPrint(const char *fmt, ...) {
+  Line l; va_list ap; va_start(ap, fmt);
+  vsnprintf(l.s, sizeof(l.s), fmt, ap); va_end(ap);
+  xQueueSend(shellQ, &l, 0);
+}
+
+// ============================ STATE ===============================
+volatile bool  armed = false;
+volatile int   flightMode = 0;          // 0 STAB, 2 ALT HOLD (ArduCopter numbers)
+volatile float stickR = 0, stickP = 0, stickY = 0, stickT = 0;  // -1..1 / 0..1
+volatile uint32_t lastManual = 0;
+volatile bool  calRequest = false;
+volatile bool  trimRequest = false;
+volatile bool  armRequest = false, disarmRequest = false;
+volatile float motorTest[4] = {0, 0, 0, 0};
+volatile uint32_t motorTestUntil = 0;
+
+float rawA[3], rawG[3];                 // before calibration (g, deg/s)
+float accC[3], gyr[3];                  // calibrated
+float q[4] = {1, 0, 0, 0};
+volatile float roll = 0, pitch = 0, yaw = 0;      // deg  (my frame)
+volatile float gyroRoll = 0, gyroPitch = 0, gyroYaw = 0;
+volatile float vbat = 0;
+volatile uint32_t imuErrors = 0, loopRate = 0;
+float vzEst = 0;
+
+// ============================ MPU6050 =============================
+#define MPU 0x68
+void mpuWrite(uint8_t r, uint8_t v) {
+  Wire.beginTransmission(MPU); Wire.write(r); Wire.write(v); Wire.endTransmission();
+}
+bool mpuInit() {
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+  Wire.setTimeOut(5);
+  Wire.beginTransmission(MPU);
+  if (Wire.endTransmission() != 0) return false;
+  mpuWrite(0x6B, 0x80); delay(100);        // reset
+  mpuWrite(0x6B, 0x01); delay(10);         // PLL gyro X
+  mpuWrite(0x1A, 0x02);                    // DLPF 98 Hz
+  mpuWrite(0x19, 0x01);                    // 500 Hz sample
+  mpuWrite(0x1B, 0x10);                    // gyro  +-1000 dps
+  mpuWrite(0x1C, 0x08);                    // accel +-4 g
+  delay(50);
+  return true;
+}
+bool readIMU() {
+  Wire.beginTransmission(MPU); Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)MPU, (uint8_t)14) != 14) return false;
+  int16_t v[7];
+  for (int i = 0; i < 7; i++) { uint8_t h = Wire.read(); uint8_t l = Wire.read(); v[i] = (int16_t)((h << 8) | l); }
+  rawA[0] = AX_SIGN * v[0] / 8192.0f;
+  rawA[1] = AY_SIGN * v[1] / 8192.0f;
+  rawA[2] = AZ_SIGN * v[2] / 8192.0f;
+  rawG[0] = GX_SIGN * v[4] / 32.8f;
+  rawG[1] = GY_SIGN * v[5] / 32.8f;
+  rawG[2] = GZ_SIGN * v[6] / 32.8f;
+  for (int i = 0; i < 3; i++) {
+    accC[i] = (rawA[i] - cfg.ab[i]) * cfg.as[i];
+    gyr[i]  = rawG[i] - cfg.gb[i];
+  }
+  return true;
+}
+
+// ============================ AHRS (Madgwick 6-axis) ==============
+float beta = 2.0f;
+void ahrs(float gx, float gy, float gz, float ax, float ay, float az, float dt) {
+  float q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
+  float qd0 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+  float qd1 = 0.5f * ( q0 * gx + q2 * gz - q3 * gy);
+  float qd2 = 0.5f * ( q0 * gy - q1 * gz + q3 * gx);
+  float qd3 = 0.5f * ( q0 * gz + q1 * gy - q2 * gx);
+  float n = sqrtf(ax * ax + ay * ay + az * az);
+  if (n > 0.3f && n < 3.0f) {              // ignore accel in high-G moments
+    ax /= n; ay /= n; az /= n;
+    float _2q0 = 2 * q0, _2q1 = 2 * q1, _2q2 = 2 * q2, _2q3 = 2 * q3;
+    float _4q0 = 4 * q0, _4q1 = 4 * q1, _4q2 = 4 * q2, _8q1 = 8 * q1, _8q2 = 8 * q2;
+    float q0q0 = q0 * q0, q1q1 = q1 * q1, q2q2 = q2 * q2, q3q3 = q3 * q3;
+    float s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+    float s1 = _4q1 * q3q3 - _2q3 * ax + 4 * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+    float s2 = 4 * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+    float s3 = 4 * q1q1 * q3 - _2q1 * ax + 4 * q2q2 * q3 - _2q2 * ay;
+    float sn = sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+    if (sn > 0) {
+      sn = 1.0f / sn; s0 *= sn; s1 *= sn; s2 *= sn; s3 *= sn;
+      qd0 -= beta * s0; qd1 -= beta * s1; qd2 -= beta * s2; qd3 -= beta * s3;
+    }
+  }
+  q0 += qd0 * dt; q1 += qd1 * dt; q2 += qd2 * dt; q3 += qd3 * dt;
+  float r = 1.0f / sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  q[0] = q0 * r; q[1] = q1 * r; q[2] = q2 * r; q[3] = q3 * r;
+}
+void eulerFromQ() {
+  float q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
+  roll  = atan2f(2 * (q0 * q1 + q2 * q3), 1 - 2 * (q1 * q1 + q2 * q2)) * RAD_TO_DEG;
+  pitch = asinf(constrain(2 * (q0 * q2 - q3 * q1), -1.0f, 1.0f)) * RAD_TO_DEG;   // + = nose DOWN
+  yaw   = atan2f(2 * (q0 * q3 + q1 * q2), 1 - 2 * (q2 * q2 + q3 * q3)) * RAD_TO_DEG;
+}
+
+// ============================ PID =================================
+struct RatePid {
+  float i = 0, prev = 0, dF = 0;
+  void reset(float m) { i = 0; prev = m; dF = 0; }
+  float run(float sp, float meas, float kp, float ki, float kd, float dt, bool active) {
+    float err = sp - meas;
+    float d = -(meas - prev) / dt;  prev = meas;               // D on measurement (no kick)
+    float a = dt / (dt + 1.0f / (TWO_PI * 50.0f));             // PT1 @ 50 Hz
+    dF += a * (d - dF);
+    if (active) i = constrain(i + ki * err * dt, -0.15f, 0.15f);
+    return kp * err + i + kd * dF;
+  }
+} pidR, pidP, pidY;
+
+// ============================ MOTORS ==============================
+const int motPin[4] = {PIN_FR, PIN_FL, PIN_RR, PIN_RL};
+void motorsInit() {
+  for (int i = 0; i < 4; i++) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcAttach(motPin[i], PWM_FREQ, PWM_BITS);
+    ledcWrite(motPin[i], 0);
+#else
+    ledcSetup(i, PWM_FREQ, PWM_BITS); ledcAttachPin(motPin[i], i); ledcWrite(i, 0);
+#endif
+  }
+}
+void motorWrite(int i, float f) {
+  f = constrain(f, 0.0f, 1.0f);
+  uint32_t d = (uint32_t)(f * ((1 << PWM_BITS) - 1));
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(motPin[i], d);
+#else
+  ledcWrite(i, d);
+#endif
+}
+void motorsOff() { for (int i = 0; i < 4; i++) motorWrite(i, 0); }
+
+// ============================ CALIBRATION =========================
+int   calStep = -1;                       // -1 = idle
+uint32_t calT0 = 0;
+double sA[3], sA2[3], sG[3]; int calN = 0;
+float posMax[3], posMin[3]; bool gotMax[3], gotMin[3];
+float calGyro[3];
+const char *calNames[6] = {"level", "nose up", "nose down", "on right side", "on left side", "upside down"};
+
+void calBeginStep() {
+  shellPrint("%d/6 Place %s [8 sec]", calStep + 1, calNames[calStep]);
+  calT0 = millis(); calN = 0;
+  for (int i = 0; i < 3; i++) { sA[i] = sA2[i] = sG[i] = 0; }
+}
+void calStart() {
+  motorsOff(); armed = false;
+  calStep = 0;
+  for (int i = 0; i < 3; i++) { gotMax[i] = gotMin[i] = false; }
+  shellPrint("Calibrating accelerometer");
+  calBeginStep();
+}
+void calFinish() {
+  float nb[3], ns[3];
+  for (int i = 0; i < 3; i++) {
+    nb[i] = (posMax[i] + posMin[i]) * 0.5f;
+    float span = posMax[i] - posMin[i];
+    ns[i] = (span > 0.5f) ? 2.0f / span : 1.0f;
+  }
+  for (int i = 0; i < 3; i++) { cfg.ab[i] = nb[i]; cfg.as[i] = ns[i]; cfg.gb[i] = calGyro[i]; }
+  bool ok = cfgSave();
+  shellPrint("gyro bias: %.6f %.6f %.6f", cfg.gb[0], cfg.gb[1], cfg.gb[2]);
+  shellPrint("accel bias: %.6f %.6f %.6f", cfg.ab[0], cfg.ab[1], cfg.ab[2]);
+  shellPrint("accel scale: %.6f %.6f %.6f", cfg.as[0], cfg.as[1], cfg.as[2]);
+  shellPrint(ok ? "\xE2\x9C\x93 Calibration done! (saved to flash)" : "Calibration done, SAVE FAILED");
+  calStep = -1;
+  q[0] = 1; q[1] = q[2] = q[3] = 0; beta = 2.0f;     // re-converge quickly
+}
+void calUpdate() {                         // called every loop while calStep>=0
+  uint32_t t = millis() - calT0;
+  if (t >= CAL_WINDOW_MS - CAL_SAMPLE_MS && t < CAL_WINDOW_MS) {
+    for (int i = 0; i < 3; i++) { sA[i] += rawA[i]; sA2[i] += rawA[i] * rawA[i]; sG[i] += rawG[i]; }
+    calN++;
+  }
+  if (t < CAL_WINDOW_MS) return;
+  if (calN < 100) { shellPrint("  no data, retry"); calBeginStep(); return; }
+  float mA[3], mG[3], sd = 0, gm = 0;
+  for (int i = 0; i < 3; i++) {
+    mA[i] = sA[i] / calN; mG[i] = sG[i] / calN;
+    float var = sA2[i] / calN - mA[i] * mA[i]; sd = max(sd, sqrtf(max(var, 0.0f)));
+    gm = max(gm, fabsf(mG[i] - (calStep == 0 ? 0 : calGyro[i])));
+  }
+  if (sd > 0.03f) { shellPrint("  moving! hold still, retry"); calBeginStep(); return; }
+  int ax = 0; for (int i = 1; i < 3; i++) if (fabsf(mA[i]) > fabsf(mA[ax])) ax = i;
+  if (fabsf(mA[ax]) < 0.75f) { shellPrint("  bad orientation, retry"); calBeginStep(); return; }
+  bool pos = mA[ax] > 0;
+  if ((pos && gotMax[ax]) || (!pos && gotMin[ax])) { shellPrint("  same side twice, retry"); calBeginStep(); return; }
+  if (pos) { posMax[ax] = mA[ax]; gotMax[ax] = true; } else { posMin[ax] = mA[ax]; gotMin[ax] = true; }
+  if (calStep == 0) for (int i = 0; i < 3; i++) calGyro[i] = mG[i];
+  calStep++;
+  if (calStep >= 6) { calFinish(); return; }
+  calBeginStep();
+}
+
+// ============================ ARM / MODE ==========================
+bool tryArm() {
+  if (calStep >= 0)               { shellPrint("arm refused: calibrating"); return false; }
+  if (stickT > 0.10f)             { shellPrint("arm refused: lower throttle"); return false; }
+  if (fabsf(roll) > 25 || fabsf(pitch) > 25) { shellPrint("arm refused: not level"); return false; }
+  if (millis() - lastManual > LINK_TIMEOUT)  { shellPrint("arm refused: no stick data"); return false; }
+  pidR.reset(gyr[0]); pidP.reset(gyr[1]); pidY.reset(gyr[2]);
+  armed = true; shellPrint("ARMED"); return true;
+}
+void doDisarm(const char *why) {
+  if (armed) shellPrint("DISARMED (%s)", why);
+  armed = false; motorsOff();
+}
+
+// ============================ CONTROL TASK ========================
+void controlTask(void *) {
+  TickType_t last = xTaskGetTickCount();
+  uint32_t lastUs = micros(), cnt = 0, cntT = millis(), vbT = 0;
+  float vbF = 0;
+  for (;;) {
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(1000 / LOOP_HZ));
+    uint32_t nowUs = micros();
+    float dt = constrain((nowUs - lastUs) * 1e-6f, 0.0005f, 0.01f);
+    lastUs = nowUs;
+
+    if (!readIMU()) {
+      imuErrors++;
+      if (armed) doDisarm("IMU error");
+      motorsOff();
+      continue;
+    }
+    if (calRequest) { calRequest = false; calStart(); }
+    if (calStep >= 0) { calUpdate(); }
+
+    ahrs(gyr[0] * DEG_TO_RAD, gyr[1] * DEG_TO_RAD, gyr[2] * DEG_TO_RAD, accC[0], accC[1], accC[2], dt);
+    if (beta > 0.08f) beta = max(0.08f, beta - dt * 1.0f);        // fast converge, then smooth
+    eulerFromQ();
+    if (trimRequest) { trimRequest = false; cfg.trimR = roll; cfg.trimP = pitch; cfgSave(); shellPrint("trim saved %.2f %.2f", cfg.trimR, cfg.trimP); }
+    float rollC = roll - cfg.trimR, pitchC = pitch - cfg.trimP;
+    gyroRoll = gyr[0]; gyroPitch = gyr[1]; gyroYaw = gyr[2];
+
+    if (armRequest)    { armRequest = false; tryArm(); }
+    if (disarmRequest) { disarmRequest = false; doDisarm("cmd"); }
+
+    // ---- safety ----
+    if (armed) {
+      if (millis() - lastManual > LINK_TIMEOUT) doDisarm("link lost");
+      else if (fabsf(rollC) > 75 || fabsf(pitchC) > 75) doDisarm("tilt/crash");
+    }
+
+    // ---- motor test (props OFF!) ----
+    if (!armed && millis() < motorTestUntil) {
+      for (int i = 0; i < 4; i++) motorWrite(i, motorTest[i]);
+      continue;
+    }
+
+    if (!armed || calStep >= 0) { motorsOff(); pidR.reset(gyr[0]); pidP.reset(gyr[1]); pidY.reset(gyr[2]); }
+    else {
+      float thr = stickT;
+      // ALT HOLD assist: damp vertical speed (no barometer -> assist only)
+      float vx = 2 * (q[1] * q[3] - q[0] * q[2]), vy = 2 * (q[0] * q[1] + q[2] * q[3]);
+      float vz = q[0] * q[0] - q[1] * q[1] - q[2] * q[2] + q[3] * q[3];
+      float aUp = (accC[0] * vx + accC[1] * vy + accC[2] * vz - 1.0f) * 9.81f;
+      vzEst += aUp * dt; vzEst -= vzEst * dt / 3.0f;
+      if (flightMode == 2 && thr > 0.15f) thr += constrain(-0.08f * vzEst, -0.12f, 0.12f);
+      else vzEst = 0;
+      thr = constrain(thr, 0.0f, 1.0f);
+
+      // ---- outer angle loop ----
+      float spR = constrain(stickR * cfg.maxAngle, -cfg.maxAngle, cfg.maxAngle);
+      float spP = constrain(stickP * cfg.maxAngle, -cfg.maxAngle, cfg.maxAngle);   // + = nose down
+      float rateR = constrain(cfg.angP * (spR - rollC),  -250.0f, 250.0f);
+      float rateP = constrain(cfg.angP * (spP - pitchC), -250.0f, 250.0f);
+      float rateY = -stickY * cfg.maxYaw;                                          // + = CCW
+
+      // ---- inner rate PID ----
+      bool act = thr > 0.08f;
+      float oR = pidR.run(rateR, gyr[0], cfg.rp, cfg.ri, cfg.rd, dt, act);
+      float oP = pidP.run(rateP, gyr[1], cfg.pp, cfg.pi, cfg.pd, dt, act);
+      float oY = pidY.run(rateY, gyr[2], cfg.yp, cfg.yi, cfg.yd, dt, act) * YAW_DIR;
+
+      if (!act) motorsOff();
+      else {
+        // X-mixer: order FR FL RR RL
+        float m[4];
+        m[0] = thr - oR - oP - oY;     // FR (CCW)
+        m[1] = thr + oR - oP + oY;     // FL (CW)
+        m[2] = thr - oR + oP + oY;     // RR (CW)
+        m[3] = thr + oR + oP - oY;     // RL (CCW)
+        float mx = max(max(m[0], m[1]), max(m[2], m[3]));
+        float mn = min(min(m[0], m[1]), min(m[2], m[3]));
+        if (mx - mn > 1.0f) { float s = 1.0f / (mx - mn); for (int i = 0; i < 4; i++) m[i] = (m[i] - mn) * s; }
+        else if (mx > 1.0f) { for (int i = 0; i < 4; i++) m[i] -= (mx - 1.0f); }
+        else if (mn < 0.0f) { for (int i = 0; i < 4; i++) m[i] -= mn; }
+        for (int i = 0; i < 4; i++) motorWrite(i, MOTOR_IDLE + constrain(m[i], 0.0f, 1.0f) * (1.0f - MOTOR_IDLE));
+      }
+    }
+
+#if USE_VBAT
+    if (millis() - vbT > 100) { vbT = millis(); vbF += 0.1f * (analogReadMilliVolts(PIN_VBAT) * 0.001f * VBAT_RATIO - vbF); vbat = vbF; }
+#endif
+    cnt++;
+    if (millis() - cntT >= 1000) { loopRate = cnt; cnt = 0; cntT = millis(); }
+  }
+}
+
+// ============================ MAVLINK =============================
+WiFiUDP udp;
+IPAddress peerIP; uint16_t peerPort = 0; bool havePeer = false, peerV1 = false;
+uint8_t txSeq = 0;
+
+int crcExtra(uint32_t id) {
+  switch (id) {
+    case 0: return 50;    case 1: return 124;  case 11: return 89;  case 30: return 39;   case 69: return 243; case 76: return 152; case 126: return 220;
+    default: return -1;
+  }
+}
+uint16_t crcAcc(uint16_t crc, uint8_t b) {
+  uint8_t t = b ^ (uint8_t)(crc & 0xFF);
+  t ^= (t << 4);
+  return (crc >> 8) ^ ((uint16_t)t << 8) ^ ((uint16_t)t << 3) ^ (t >> 4);
+}
+void mavSend(uint32_t id, const uint8_t *pl, uint8_t len) {
+  int ex = crcExtra(id); if (ex < 0) return;
+  uint8_t b[300]; int n = 0;
+  uint16_t crc = 0xFFFF;
+  if (peerV1) {
+    b[n++] = 0xFE; b[n++] = len; b[n++] = txSeq++; b[n++] = 1; b[n++] = 1; b[n++] = id;
+  } else {
+    b[n++] = 0xFD; b[n++] = len; b[n++] = 0; b[n++] = 0; b[n++] = txSeq++; b[n++] = 1; b[n++] = 1;
+    b[n++] = id & 0xFF; b[n++] = (id >> 8) & 0xFF; b[n++] = (id >> 16) & 0xFF;
+  }
+  memcpy(b + n, pl, len); n += len;
+  for (int i = 1; i < n; i++) crc = crcAcc(crc, b[i]);
+  crc = crcAcc(crc, (uint8_t)ex);
+  b[n++] = crc & 0xFF; b[n++] = crc >> 8;
+  if (havePeer) udp.beginPacket(peerIP, peerPort);
+  else          udp.beginPacket(IPAddress(192, 168, 4, 255), UDP_PORT);
+  udp.write(b, n); udp.endPacket();
+}
+void sendHeartbeat() {
+  uint8_t p[9] = {0};
+  uint32_t cm = flightMode; memcpy(p, &cm, 4);
+  p[4] = 2;                                    // MAV_TYPE_QUADROTOR
+  p[5] = 0;                                    // MAV_AUTOPILOT_GENERIC
+  p[6] = 1 | (armed ? 128 : 0);                // custom mode enabled | armed
+  p[7] = armed ? 4 : 3;                        // ACTIVE / STANDBY
+  p[8] = 3;
+  mavSend(0, p, 9);
+}
+void sendAttitude() {
+  uint8_t p[28]; uint32_t t = millis();
+  float v[6] = {roll * DEG_TO_RAD, -(pitch - cfg.trimP) * DEG_TO_RAD, -yaw * DEG_TO_RAD,
+                gyroRoll * DEG_TO_RAD, -gyroPitch * DEG_TO_RAD, -gyroYaw * DEG_TO_RAD};
+  v[0] = (roll - cfg.trimR) * DEG_TO_RAD;
+  memcpy(p, &t, 4); memcpy(p + 4, v, 24);
+  mavSend(30, p, 28);                          // ATTITUDE = id 30
+}
+void sendSysStatus() {
+  uint8_t p[31] = {0};
+  uint16_t mv = (uint16_t)(vbat * 1000.0f);
+  memcpy(p + 14, &mv, 2);
+  p[30] = 100;
+  mavSend(1, p, 31);
+}
+void shellReply(const char *s) {
+  size_t n = strlen(s);
+  for (size_t o = 0; o < n; o += 70) {
+    uint8_t p[79] = {0};
+    size_t c = min((size_t)70, n - o);
+    p[6] = 10; p[7] = 1; p[8] = c;             // device=SHELL, flags=REPLY
+    memcpy(p + 9, s + o, c);
+    mavSend(126, p, 79);
+  }
+}
+void drainShell() {
+  Line l; int k = 0;
+  while (k++ < 12 && xQueueReceive(shellQ, &l, 0) == pdTRUE) {
+    char o[100]; snprintf(o, sizeof(o), "%s\n", l.s);
+    shellReply(o);
+  }
+}
+
+// ---------------- shell commands ----------------
+struct Var { const char *n; float *p; };
+Var vars[] = {
+  {"rp", &cfg.rp}, {"ri", &cfg.ri}, {"rd", &cfg.rd},
+  {"pp", &cfg.pp}, {"pi", &cfg.pi}, {"pd", &cfg.pd},
+  {"yp", &cfg.yp}, {"yi", &cfg.yi}, {"yd", &cfg.yd},
+  {"angp", &cfg.angP}, {"maxangle", &cfg.maxAngle}, {"maxyaw", &cfg.maxYaw},
+};
+void handleCommand(String c) {
+  c.trim(); if (!c.length()) return;
+  String lc = c; lc.toLowerCase();
+  if (lc == "ca")                { calRequest = true; }
+  else if (lc == "altoff")       { flightMode = 0; shellPrint("alt hold OFF (STAB)"); }
+  else if (lc == "alton")        { flightMode = 2; shellPrint("alt hold ON"); }
+  else if (lc == "arm")          { armRequest = true; }
+  else if (lc == "disarm")       { disarmRequest = true; }
+  else if (lc == "save")         { shellPrint(cfgSave() ? "saved to flash" : "save FAILED"); }
+  else if (lc == "trim")         { trimRequest = true; }
+  else if (lc == "reset")        { cfgDefaults(); cfgSave(); shellPrint("defaults restored (run ca again)"); }
+  else if (lc == "reboot")       { shellPrint("rebooting"); delay(200); ESP.restart(); }
+  else if (lc == "pid") {
+    shellPrint("roll  P%.5f I%.5f D%.6f", cfg.rp, cfg.ri, cfg.rd);
+    shellPrint("pitch P%.5f I%.5f D%.6f", cfg.pp, cfg.pi, cfg.pd);
+    shellPrint("yaw   P%.5f I%.5f D%.6f", cfg.yp, cfg.yi, cfg.yd);
+    shellPrint("angP %.2f maxAngle %.0f maxYaw %.0f", cfg.angP, cfg.maxAngle, cfg.maxYaw);
+  }
+  else if (lc == "status") {
+    shellPrint("roll %.1f pitch %.1f yaw %.1f", roll - cfg.trimR, pitch - cfg.trimP, yaw);
+    shellPrint("armed %d mode %d loop %luHz imuErr %lu", (int)armed, (int)flightMode, (unsigned long)loopRate, (unsigned long)imuErrors);
+    shellPrint("stick R%.2f P%.2f Y%.2f T%.2f", stickR, stickP, stickY, stickT);
+  }
+  else if (lc.startsWith("set ")) {
+    int s1 = lc.indexOf(' '), s2 = lc.indexOf(' ', s1 + 1);
+    if (s2 < 0) { shellPrint("usage: set <name> <value>"); return; }
+    String n = lc.substring(s1 + 1, s2); float v = lc.substring(s2 + 1).toFloat();
+    for (auto &x : vars) if (n == x.n) { *x.p = v; shellPrint("%s = %.6f (type save)", x.n, v); return; }
+    shellPrint("unknown: %s", n.c_str());
+  }
+  else if (lc.startsWith("mt ")) {               // mt <1-4> <percent>   PROPS OFF!
+    int s1 = lc.indexOf(' '), s2 = lc.indexOf(' ', s1 + 1);
+    int m = lc.substring(s1 + 1, s2).toInt(); float pc = lc.substring(s2 + 1).toFloat() / 100.0f;
+    if (m < 1 || m > 4 || armed) { shellPrint("mt <1-4> <pct> (disarmed only)"); return; }
+    for (int i = 0; i < 4; i++) motorTest[i] = 0;
+    motorTest[m - 1] = constrain(pc, 0.0f, 0.5f); motorTestUntil = millis() + 3000;
+    shellPrint("motor %d (1=FR 2=FL 3=RR 4=RL) 3 s", m);
+  }
+  else shellPrint("cmds: ca altoff alton arm disarm status pid set save trim reset mt reboot");
+}
+
+// ---------------- incoming messages ----------------
+String shellLine;
+void onMessage(uint32_t id, const uint8_t *pl) {
+  switch (id) {
+    case 69: {                                   // MANUAL_CONTROL
+      int16_t x, y, z, r; memcpy(&x, pl, 2); memcpy(&y, pl + 2, 2); memcpy(&z, pl + 4, 2); memcpy(&r, pl + 6, 2);
+      stickP = constrain(x / 1000.0f, -1.0f, 1.0f);
+      stickR = constrain(y / 1000.0f, -1.0f, 1.0f);
+      stickT = constrain(z / 1000.0f, 0.0f, 1.0f);
+      stickY = constrain(r / 1000.0f, -1.0f, 1.0f);
+      lastManual = millis();
+    } break;
+    case 76: {                                   // COMMAND_LONG
+      float p1, p2; uint16_t cmd;
+      memcpy(&p1, pl, 4); memcpy(&p2, pl + 4, 4); memcpy(&cmd, pl + 28, 2);
+      if (cmd == 400) { if (p1 > 0.5f) armRequest = true; else disarmRequest = true; }
+      else if (cmd == 176) flightMode = ((int)p2 == 2) ? 2 : 0;
+    } break;
+    case 11: {                                   // SET_MODE
+      uint32_t cm; memcpy(&cm, pl, 4); flightMode = (cm == 2) ? 2 : 0;
+    } break;
+    case 126: {                                  // SERIAL_CONTROL (shell)
+      uint8_t cnt = pl[8]; if (cnt > 70) cnt = 70;
+      for (int i = 0; i < cnt; i++) {
+        char ch = pl[9 + i];
+        if (ch == '\n' || ch == '\r') { handleCommand(shellLine); shellLine = ""; }
+        else if (ch) shellLine += ch;
+      }
+      if (shellLine.length() && cnt < 70) { handleCommand(shellLine); shellLine = ""; }
+    } break;
+  }
+}
+void pollUDP() {
+  int sz = udp.parsePacket();
+  while (sz > 0) {
+    uint8_t b[320]; int n = udp.read(b, min(sz, 320));
+    peerIP = udp.remoteIP(); peerPort = udp.remotePort(); havePeer = true;
+    int i = 0;
+    while (i < n) {
+      if (b[i] == 0xFD && i + 12 <= n) {
+        uint8_t len = b[i + 1]; bool sig = b[i + 2] & 1; int tot = 12 + len + (sig ? 13 : 0);
+        if (i + tot > n) break;
+        uint32_t id = b[i + 7] | (b[i + 8] << 8) | (b[i + 9] << 16);
+        int ex = crcExtra(id);
+        if (ex >= 0) {
+          uint16_t crc = 0xFFFF; for (int k = 1; k < 10 + len; k++) crc = crcAcc(crc, b[i + k]);
+          crc = crcAcc(crc, ex);
+          if (crc == (b[i + 10 + len] | (b[i + 11 + len] << 8))) {
+            uint8_t pl[260] = {0}; memcpy(pl, b + i + 10, len);   // zero-extend trimmed payload
+            peerV1 = false; onMessage(id, pl);
+          }
+        }
+        i += tot;
+      } else if (b[i] == 0xFE && i + 8 <= n) {
+        uint8_t len = b[i + 1]; int tot = 8 + len;
+        if (i + tot > n) break;
+        uint32_t id = b[i + 5]; int ex = crcExtra(id);
+        if (ex >= 0) {
+          uint16_t crc = 0xFFFF; for (int k = 1; k < 6 + len; k++) crc = crcAcc(crc, b[i + k]);
+          crc = crcAcc(crc, ex);
+          if (crc == (b[i + 6 + len] | (b[i + 7 + len] << 8))) {
+            uint8_t pl[260] = {0}; memcpy(pl, b + i + 6, len);
+            peerV1 = true; onMessage(id, pl);
+          }
+        }
+        i += tot;
+      } else i++;
+    }
+    sz = udp.parsePacket();
+  }
+}
+
+// ============================ SETUP / LOOP ========================
+void gyroBootZero() {                            // auto-zero gyro, keeps saved value if moving
+  float s[3] = {0, 0, 0}, mx[3] = {-999, -999, -999}, mn[3] = {999, 999, 999}; int n = 0;
+  for (int i = 0; i < 400; i++) {
+    if (readIMU()) { for (int k = 0; k < 3; k++) { s[k] += rawG[k]; mx[k] = max(mx[k], rawG[k]); mn[k] = min(mn[k], rawG[k]); } n++; }
+    delay(3);
+  }
+  if (n < 300) return;
+  for (int k = 0; k < 3; k++) if (mx[k] - mn[k] > 6.0f) return;   // moved -> keep saved bias
+  for (int k = 0; k < 3; k++) cfg.gb[k] = s[k] / n;                // RAM only
+}
+void setup() {
+  Serial.begin(115200);
+  motorsInit(); motorsOff();
+  shellQ = xQueueCreate(40, sizeof(Line));
+  cfgLoad();
+  if (!mpuInit()) { Serial.println("MPU6050 NOT FOUND"); }
+  gyroBootZero();
+  // seed attitude from accel so it starts level quickly
+  for (int i = 0; i < 200; i++) { readIMU(); ahrs(0, 0, 0, accC[0], accC[1], accC[2], 0.01f); delay(2); }
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(WIFI_SSID, WIFI_PASS);
+  WiFi.setSleep(false);
+  udp.begin(UDP_PORT);
+  xTaskCreatePinnedToCore(controlTask, "ctrl", 6144, nullptr, 5, nullptr, 1);
+  Serial.println("AerialX FC ready");
+}
+void loop() {
+  static uint32_t tHb = 0, tAtt = 0, tSys = 0;
+  pollUDP();
+  drainShell();
+  uint32_t now = millis();
+  if (now - tHb  >= 1000) { tHb = now;  sendHeartbeat(); }
+  if (now - tAtt >= 50)   { tAtt = now; sendAttitude(); }
+  if (now - tSys >= 500)  { tSys = now; sendSysStatus(); }
+  delay(2);
+}
