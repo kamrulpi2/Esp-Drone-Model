@@ -1,5 +1,5 @@
 /*
- * AerialX Flight Controller  -  ESP32 DevKit V1 + MPU6050
+ * Kamrul Flight Controller  -  ESP32 DevKit V1 + MPU6050
  * --------------------------------------------------------
  *  - Madgwick AHRS (fast start, then fine)           -> stable attitude
  *  - Cascaded control: Angle P  ->  Rate PID (+ filtered D on measurement,
@@ -32,7 +32,7 @@
 #include <stdarg.h>
 
 // ============================ CONFIG ==============================
-#define WIFI_SSID      "AerialX"
+#define WIFI_SSID      "KamrulX"
 #define WIFI_PASS      "12345678"      // min 8 chars
 #define UDP_PORT       14550
 
